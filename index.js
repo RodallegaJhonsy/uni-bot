@@ -2,7 +2,6 @@ require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
-// Importar servicios
 const { checkUser, createTask, listTasks, deleteTask, calculateNeededGrade } = require('./services/taskService');
 const { registerGroup, getGlobalStats, getGroupList } = require('./services/adminService');
 const initScheduler = require('./scheduler/reminder');
@@ -11,8 +10,11 @@ const { readDB } = require('./database/adapter');
 const OWNER_NUMBER = process.env.OWNER_NUMBER;
 const BOT_NUMBER = process.env.BOT_NUMBER; 
 
-// Función principal que se reinicia a sí misma si falla
-async function startBot() {
+// --- CANDADO DE SEGURIDAD ---
+// Esto evita que el bot pida el código 2 veces y se crashee
+let isPairingCodeRequested = false;
+
+async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
     const sock = makeWASocket({
@@ -22,58 +24,67 @@ async function startBot() {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
         },
-        browser: Browsers.ubuntu("Chrome"), // Más estable en Termux
+        browser: Browsers.ubuntu("Chrome"),
         markOnlineOnConnect: true,
         generateHighQualityLinkPreview: true,
         syncFullHistory: false,
-        retryRequestDelayMs: 2000, 
+        retryRequestDelayMs: 5000, 
         connectTimeoutMs: 60000, 
     });
 
-    // --- LÓGICA DE CÓDIGO DE VINCULACIÓN (CON REINTENTO INFINITO) ---
+    // --- LÓGICA DE PAIRING CODE BLINDADA ---
     if (!sock.authState.creds.registered) {
         
-        if (!BOT_NUMBER) {
-            console.log('❌ ERROR: Define BOT_NUMBER en tu archivo .env');
-            process.exit(1);
-        }
+        // Si ya pedimos el código, NO hacemos nada (Evita el error 428)
+        if (!isPairingCodeRequested) {
+            isPairingCodeRequested = true; // 🔒 CERRAMOS EL CANDADO
 
-        // Bucle para intentar pedir el código hasta que funcione
-        setTimeout(async () => {
-            try {
-                console.log('⏳ Conectando para pedir código...');
-                await delay(3000); // Espera técnica
-                
-                // Intentamos pedir el código
-                const code = await sock.requestPairingCode(BOT_NUMBER);
-                
-                // Si llegamos aquí, ¡FUNCIONÓ!
-                console.clear();
-                console.log('▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄');
-                console.log(`🥂 TU CÓDIGO:   ${code}`);
-                console.log('▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀');
-                console.log('⚡ ¡CORRE A WHATSAPP! ⚡');
-
-            } catch (err) {
-                // Si falla, no mostramos error feo, solo avisamos y reintentamos
-                console.log('⚠️ Falló la petición del código. Reintentando en 2s...');
+            if (!BOT_NUMBER) {
+                console.log('❌ ERROR: Define BOT_NUMBER en tu archivo .env');
+                process.exit(1);
             }
-        }, 3000);
+
+            setTimeout(async () => {
+                try {
+                    console.log('⏳ Iniciando protocolo de vinculación...');
+                    await delay(4000); // Esperamos a que la conexión sea estable
+                    
+                    const code = await sock.requestPairingCode(BOT_NUMBER);
+                    
+                    console.clear();
+                    console.log('▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄');
+                    console.log(`🥂 TU CÓDIGO:   ${code}`);
+                    console.log('▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀');
+                    console.log('⚡ NO CIERRES ESTA PANTALLA ⚡');
+
+                } catch (err) {
+                    console.log('⚠️ Error al pedir código. Reinicia el bot manualmente.');
+                    isPairingCodeRequested = false; // Abrimos candado por si falló real
+                }
+            }, 3000);
+        }
     }
 
     initScheduler(sock);
 
-    // Manejo de conexión
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         
         if (connection === 'close') {
             const reason = lastDisconnect.error?.output?.statusCode;
-            console.log(`⚠️ Conexión cerrada (${reason}). Reiniciando...`);
+            const shouldReconnect = reason !== DisconnectReason.loggedOut;
             
-            // Si se cierra, volvemos a llamar a startBot()
-            await delay(3000);
-            startBot(); 
+            console.log(`⚠️ Conexión inestable (${reason})...`);
+            
+            if (shouldReconnect) {
+                // Si estamos en proceso de vinculación, NO reconectamos agresivamente
+                if (isPairingCodeRequested && !sock.authState.creds.registered) {
+                    console.log('⏳ Esperando a que vincules...');
+                } else {
+                    await delay(3000);
+                    connectToWhatsApp();
+                }
+            }
         } else if (connection === 'open') {
             console.log('✅ BOT CONECTADO Y LISTO');
         }
@@ -114,7 +125,6 @@ async function startBot() {
                 case 'grupos': if (isAdmin) await sock.sendMessage(userJid, { text: getGroupList() }); break;
                 case 'anuncioglobal':
                     if (!isAdmin) return;
-                    if (!argsJoined) return await sock.sendMessage(userJid, { text: '⚠️ Falta mensaje.' });
                     const db = readDB();
                     for (const group of db.groups) await sock.sendMessage(group.id, { text: `📢 ${argsJoined}` });
                     await sock.sendMessage(userJid, { text: `✅ Enviado.` });
@@ -124,5 +134,4 @@ async function startBot() {
     });
 }
 
-// Iniciamos la función
-startBot();
+connectToWhatsApp();
