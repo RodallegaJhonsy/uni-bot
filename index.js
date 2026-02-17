@@ -2,7 +2,6 @@ require('dotenv').config();
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
-// Importamos servicios y base de datos
 const { checkUser, createTask, listTasks, deleteTask, calculateNeededGrade } = require('./services/taskService');
 const { registerGroup, getGlobalStats, getGroupList } = require('./services/adminService');
 const initScheduler = require('./scheduler/reminder');
@@ -16,43 +15,45 @@ async function connectToWhatsApp() {
 
     const sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // NO QR
+        printQRInTerminal: false,
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
         },
-        browser: Browsers.ubuntu("Chrome"), // Navegador Linux estándar
+        // Usamos Mac Chrome para simular un PC estable
+        browser: Browsers.macOS("Chrome"),
         markOnlineOnConnect: true,
-        generateHighQualityLinkPreview: true,
+        mobile: false, 
         syncFullHistory: false,
-        retryRequestDelayMs: 5000, // Esperar 5s si falla una petición
-        connectTimeoutMs: 60000,   // Darle 60s para conectar (útil en Termux)
+        retryRequestDelayMs: 2000, 
+        keepAliveIntervalMs: 10000, // Mantiene la conexión viva
+        connectTimeoutMs: 60000, 
     });
 
-    // --- LÓGICA DE PAIRING CODE ---
-    // Solo pedimos código si NO estamos registrados y NO estamos conectando ya
+    // --- LÓGICA DE PAIRING CODE MEJORADA ---
     if (!sock.authState.creds.registered) {
         
-        if (!BOT_NUMBER) {
-            console.log('❌ ERROR: Define BOT_NUMBER en tu archivo .env');
-            process.exit(1);
-        }
+        // Espera inicial para estabilizar
+        await delay(3000);
 
-        // Esperamos 5 segundos para asegurar que el socket esté listo
-        const codeDelay = 5000;
-        console.log(`⏳ Esperando ${codeDelay/1000}s para generar código...`);
-        await delay(codeDelay);
-
-        try {
-            // Pedimos el código
-            const code = await sock.requestPairingCode(BOT_NUMBER);
-            console.log('▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄');
-            console.log(`🥂 TU CÓDIGO:   ${code}`);
-            console.log('▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀');
-            console.log('⚡ TIENES 60 SEGUNDOS PARA PONERLO EN WHATSAPP ⚡');
-        } catch (err) {
-            console.log('⚠️ No se pudo generar el código (Error de conexión).');
-            console.log('👉 Intenta reiniciar con: node index.js');
+        if (BOT_NUMBER) {
+            try {
+                // Verificamos si el socket está abierto antes de pedir
+                console.log('⏳ Generando código (No cambies de App todavía)...');
+                
+                const code = await sock.requestPairingCode(BOT_NUMBER);
+                
+                console.log('▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄');
+                console.log(`🥂 CÓDIGO:   ${code}`);
+                console.log('▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀');
+                console.log('⚡ CORRE: Tienes 60s (Usa Pantalla Dividida si puedes) ⚡');
+                
+            } catch (err) {
+                // SI FALLA AL CAMBIAR DE APP, NO SE ROMPE
+                console.log('⚠️ La conexión se pausó (¿Cambiaste de app?).');
+                console.log('🔄 Reintentando en 5 segundos...');
+                await delay(5000);
+            }
         }
     }
 
@@ -62,17 +63,19 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect } = update;
         
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(`⚠️ Conexión cerrada. ¿Reconectar?: ${shouldReconnect}`);
+            // Lógica de reconexión mejorada
+            const reason = lastDisconnect.error?.output?.statusCode;
+            const shouldReconnect = reason !== DisconnectReason.loggedOut;
             
+            console.log(`⚠️ Desconectado (${reason}). Reconectando: ${shouldReconnect}`);
+
             if (shouldReconnect) {
-                // ESPERAMOS 5 SEGUNDOS ANTES DE RECONECTAR (Anti-Crash)
-                console.log('⏳ Esperando 5s para reconectar...');
-                await delay(5000);
+                // Espera progresiva para no saturar
+                await delay(3000);
                 connectToWhatsApp();
             }
         } else if (connection === 'open') {
-            console.log('✅ BOT CONECTADO Y ESTABLE');
+            console.log('✅ BOT CONECTADO Y LISTO');
         }
     });
 
@@ -93,7 +96,6 @@ async function connectToWhatsApp() {
         const commandBody = msgText.slice(1).trim(); 
         const [command, ...args] = commandBody.split(' ');
         const argsJoined = args.join(' ');
-
         const isAdmin = OWNER_NUMBER ? userJid.includes(OWNER_NUMBER) : false;
 
         await checkUser(userJid, pushName);
@@ -116,46 +118,32 @@ async function connectToWhatsApp() {
 ╰──────────────────`;
                     await sock.sendMessage(userJid, { text: menu });
                     break;
-
                 case 'tarea':
-                    const r1 = await createTask(userJid, argsJoined);
-                    await sock.sendMessage(userJid, { text: r1 });
+                    await sock.sendMessage(userJid, { text: await createTask(userJid, argsJoined) });
                     break;
-                
                 case 'lista':
-                    const r2 = await listTasks(userJid);
-                    await sock.sendMessage(userJid, { text: r2 });
+                    await sock.sendMessage(userJid, { text: await listTasks(userJid) });
                     break;
-
                 case 'borrar':
-                    const r3 = await deleteTask(userJid, argsJoined);
-                    await sock.sendMessage(userJid, { text: r3 });
+                    await sock.sendMessage(userJid, { text: await deleteTask(userJid, argsJoined) });
                     break;
-
                 case 'notanecesaria':
-                    const r4 = calculateNeededGrade(argsJoined);
-                    await sock.sendMessage(userJid, { text: r4 });
+                    await sock.sendMessage(userJid, { text: calculateNeededGrade(argsJoined) });
                     break;
-
                 case 'panel':
                     if (isAdmin) await sock.sendMessage(userJid, { text: `👑 *PANEL*\n1️⃣ /statsGlobal\n2️⃣ /grupos\n3️⃣ /anuncioGlobal` });
                     break;
-
                 case 'statsglobal':
                     if (isAdmin) await sock.sendMessage(userJid, { text: getGlobalStats() });
                     break;
-
                 case 'grupos':
                     if (isAdmin) await sock.sendMessage(userJid, { text: getGroupList() });
                     break;
-
                 case 'anuncioglobal':
                     if (!isAdmin) return;
                     if (!argsJoined) return await sock.sendMessage(userJid, { text: '⚠️ Falta mensaje.' });
                     const db = readDB();
-                    for (const group of db.groups) {
-                        await sock.sendMessage(group.id, { text: `📢 ${argsJoined}` });
-                    }
+                    for (const group of db.groups) await sock.sendMessage(group.id, { text: `📢 ${argsJoined}` });
                     await sock.sendMessage(userJid, { text: `✅ Enviado.` });
                     break;
             }
