@@ -1,7 +1,8 @@
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay, Browsers, makeCacheableSignalKeyStore } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
+// Importamos servicios y base de datos
 const { checkUser, createTask, listTasks, deleteTask, calculateNeededGrade } = require('./services/taskService');
 const { registerGroup, getGlobalStats, getGroupList } = require('./services/adminService');
 const initScheduler = require('./scheduler/reminder');
@@ -16,57 +17,62 @@ async function connectToWhatsApp() {
     const sock = makeWASocket({
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false, // NO QR
-        auth: state,
-        // Usamos una configuración de navegador específica para Linux/Termux
-        browser: Browsers.macOS("Chrome"),
-        syncFullHistory: false // Ahorra memoria en Termux
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
+        },
+        browser: Browsers.ubuntu("Chrome"), // Navegador Linux estándar
+        markOnlineOnConnect: true,
+        generateHighQualityLinkPreview: true,
+        syncFullHistory: false,
+        retryRequestDelayMs: 5000, // Esperar 5s si falla una petición
+        connectTimeoutMs: 60000,   // Darle 60s para conectar (útil en Termux)
     });
 
-    // --- LÓGICA DE PAIRING CODE (BLINDADA) ---
+    // --- LÓGICA DE PAIRING CODE ---
+    // Solo pedimos código si NO estamos registrados y NO estamos conectando ya
     if (!sock.authState.creds.registered) {
         
-        // Verificamos que el número exista
         if (!BOT_NUMBER) {
-            console.log('❌ ERROR: Define BOT_NUMBER en tu archivo .env (sin el +)');
+            console.log('❌ ERROR: Define BOT_NUMBER en tu archivo .env');
             process.exit(1);
         }
 
-        // Esperamos un poco más para que Termux establezca conexión
-        const codeDelay = 6000;
+        // Esperamos 5 segundos para asegurar que el socket esté listo
+        const codeDelay = 5000;
         console.log(`⏳ Esperando ${codeDelay/1000}s para generar código...`);
         await delay(codeDelay);
 
         try {
+            // Pedimos el código
             const code = await sock.requestPairingCode(BOT_NUMBER);
             console.log('▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄');
-            console.log(`🥂 TU CÓDIGO DE VINCULACIÓN: ${code}`);
+            console.log(`🥂 TU CÓDIGO:   ${code}`);
             console.log('▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀');
+            console.log('⚡ TIENES 60 SEGUNDOS PARA PONERLO EN WHATSAPP ⚡');
         } catch (err) {
-            console.log('⚠️ Error pidiendo código. Reintentando en 3s...');
-            // Si falla, reintentamos una vez más
-            await delay(3000);
-            try {
-                const codeRetry = await sock.requestPairingCode(BOT_NUMBER);
-                console.log(`🥂 CÓDIGO (INTENTO 2): ${codeRetry}`);
-            } catch (e) {
-                console.error('❌ No se pudo generar el código. Reinicia el bot.');
-            }
+            console.log('⚠️ No se pudo generar el código (Error de conexión).');
+            console.log('👉 Intenta reiniciar con: node index.js');
         }
     }
 
     initScheduler(sock);
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
+        
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            // Evitamos spam de reconexión si es error de validación
+            console.log(`⚠️ Conexión cerrada. ¿Reconectar?: ${shouldReconnect}`);
+            
             if (shouldReconnect) {
-                console.log('🔄 Reconectando...');
+                // ESPERAMOS 5 SEGUNDOS ANTES DE RECONECTAR (Anti-Crash)
+                console.log('⏳ Esperando 5s para reconectar...');
+                await delay(5000);
                 connectToWhatsApp();
             }
         } else if (connection === 'open') {
-            console.log('✅ BOT CONECTADO VIA PAIRING CODE');
+            console.log('✅ BOT CONECTADO Y ESTABLE');
         }
     });
 
@@ -80,9 +86,7 @@ async function connectToWhatsApp() {
         const pushName = m.pushName || 'Usuario';
         const msgText = m.message.conversation || m.message.extendedTextMessage?.text || '';
 
-        if (userJid.endsWith('@g.us')) {
-            registerGroup(userJid, 'Grupo WhatsApp'); 
-        }
+        if (userJid.endsWith('@g.us')) registerGroup(userJid, 'Grupo'); 
 
         if (!msgText.startsWith('/')) return;
 
@@ -90,7 +94,7 @@ async function connectToWhatsApp() {
         const [command, ...args] = commandBody.split(' ');
         const argsJoined = args.join(' ');
 
-        const isAdmin = userJid.includes(OWNER_NUMBER);
+        const isAdmin = OWNER_NUMBER ? userJid.includes(OWNER_NUMBER) : false;
 
         await checkUser(userJid, pushName);
 
@@ -102,7 +106,6 @@ async function connectToWhatsApp() {
 │
 │ 📝 *AGENDA*
 │ 🔹 */tarea* [descripción] -cada [tiempo]
-│    _Ej: /tarea Pastilla -cada 8h_
 │ 🔹 */lista* y */borrar*
 │
 │ 🧮 *CALCULADORAS*
@@ -135,9 +138,7 @@ async function connectToWhatsApp() {
                     break;
 
                 case 'panel':
-                    if (!isAdmin) return;
-                    const panel = `👑 *PANEL DE ADMIN* 👑\n1️⃣ /statsGlobal\n2️⃣ /grupos\n3️⃣ /anuncioGlobal [msg]`;
-                    await sock.sendMessage(userJid, { text: panel });
+                    if (isAdmin) await sock.sendMessage(userJid, { text: `👑 *PANEL*\n1️⃣ /statsGlobal\n2️⃣ /grupos\n3️⃣ /anuncioGlobal` });
                     break;
 
                 case 'statsglobal':
@@ -150,10 +151,10 @@ async function connectToWhatsApp() {
 
                 case 'anuncioglobal':
                     if (!isAdmin) return;
-                    if (!argsJoined) return await sock.sendMessage(userJid, { text: '⚠️ Escribe el mensaje.' });
+                    if (!argsJoined) return await sock.sendMessage(userJid, { text: '⚠️ Falta mensaje.' });
                     const db = readDB();
                     for (const group of db.groups) {
-                        await sock.sendMessage(group.id, { text: `📢 *ANUNCIO*\n\n${argsJoined}` });
+                        await sock.sendMessage(group.id, { text: `📢 ${argsJoined}` });
                     }
                     await sock.sendMessage(userJid, { text: `✅ Enviado.` });
                     break;
