@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, delay, Browsers } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 
 const { checkUser, createTask, listTasks, deleteTask, calculateNeededGrade } = require('./services/taskService');
@@ -8,33 +8,49 @@ const initScheduler = require('./scheduler/reminder');
 const { readDB } = require('./database/adapter');
 
 const OWNER_NUMBER = process.env.OWNER_NUMBER;
-const BOT_NUMBER = process.env.BOT_NUMBER; // El número que pondrás en .env
+const BOT_NUMBER = process.env.BOT_NUMBER; 
 
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
     const sock = makeWASocket({
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // DESACTIVAMOS QR
+        printQRInTerminal: false, // NO QR
         auth: state,
-        browser: ["Ubuntu", "Chrome", "20.0.04"] // Simula un navegador Linux (ideal para Termux)
+        // Usamos una configuración de navegador específica para Linux/Termux
+        browser: Browsers.macOS("Chrome"),
+        syncFullHistory: false // Ahorra memoria en Termux
     });
 
-    // --- LÓGICA DE PAIRING CODE ---
+    // --- LÓGICA DE PAIRING CODE (BLINDADA) ---
     if (!sock.authState.creds.registered) {
-        // Esperamos un momento para asegurar conexión
-        const codeDelay = 4000;
+        
+        // Verificamos que el número exista
+        if (!BOT_NUMBER) {
+            console.log('❌ ERROR: Define BOT_NUMBER en tu archivo .env (sin el +)');
+            process.exit(1);
+        }
+
+        // Esperamos un poco más para que Termux establezca conexión
+        const codeDelay = 6000;
         console.log(`⏳ Esperando ${codeDelay/1000}s para generar código...`);
         await delay(codeDelay);
 
-        // Solicitamos el código usando el número del .env
-        if (BOT_NUMBER) {
+        try {
             const code = await sock.requestPairingCode(BOT_NUMBER);
             console.log('▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄');
             console.log(`🥂 TU CÓDIGO DE VINCULACIÓN: ${code}`);
             console.log('▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀');
-        } else {
-            console.log('❌ ERROR: Define BOT_NUMBER en tu archivo .env');
+        } catch (err) {
+            console.log('⚠️ Error pidiendo código. Reintentando en 3s...');
+            // Si falla, reintentamos una vez más
+            await delay(3000);
+            try {
+                const codeRetry = await sock.requestPairingCode(BOT_NUMBER);
+                console.log(`🥂 CÓDIGO (INTENTO 2): ${codeRetry}`);
+            } catch (e) {
+                console.error('❌ No se pudo generar el código. Reinicia el bot.');
+            }
         }
     }
 
@@ -44,7 +60,11 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect) connectToWhatsApp();
+            // Evitamos spam de reconexión si es error de validación
+            if (shouldReconnect) {
+                console.log('🔄 Reconectando...');
+                connectToWhatsApp();
+            }
         } else if (connection === 'open') {
             console.log('✅ BOT CONECTADO VIA PAIRING CODE');
         }
@@ -60,7 +80,6 @@ async function connectToWhatsApp() {
         const pushName = m.pushName || 'Usuario';
         const msgText = m.message.conversation || m.message.extendedTextMessage?.text || '';
 
-        // Registro de grupos
         if (userJid.endsWith('@g.us')) {
             registerGroup(userJid, 'Grupo WhatsApp'); 
         }
@@ -71,7 +90,6 @@ async function connectToWhatsApp() {
         const [command, ...args] = commandBody.split(' ');
         const argsJoined = args.join(' ');
 
-        // Verificación de Admin usando .includes (más seguro)
         const isAdmin = userJid.includes(OWNER_NUMBER);
 
         await checkUser(userJid, pushName);
